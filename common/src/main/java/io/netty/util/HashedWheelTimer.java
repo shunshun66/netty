@@ -597,7 +597,8 @@ public class HashedWheelTimer implements Timer {
         public boolean add(HashedWheelTimeoutNode timeout) {
             timeout.setNext(null);
             Lock l = lock.readLock();
-            // try to lock if not possible it is hold because of
+            // try to lock if not possible it is hold because of expireTimeouts.
+            // In this case we will try to add it to another bucket.
             if (l.tryLock()) {
                 try {
                     getAndSet(timeout).setNext(timeout);
