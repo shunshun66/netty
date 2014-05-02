@@ -31,6 +31,9 @@ import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * A {@link Timer} optimized for approximated I/O timeout scheduling.
@@ -328,7 +331,7 @@ public class HashedWheelTimer implements Timer {
         if (leak != null) {
             leak.close();
         }
-        return worker.notProcessedTimeouts();
+        return worker.unprocessedTimeouts();
     }
 
     @Override
@@ -342,12 +345,24 @@ public class HashedWheelTimer implements Timer {
         start();
 
         long deadline = System.nanoTime() + unit.toNanos(delay) - startTime;
+        long calculated = deadline / tickDuration;
 
-        // Add the timeout to the wheel.
-        HashedWheelTimeout timeout = new HashedWheelTimeout(this, task, deadline);
-        wheel[timeout.stopIndex].add(timeout);
+        for (;;) {
+            long t = TICK_UPDATER.get(this);
+            long remainingRounds = (calculated - t) / wheel.length;
 
-        return timeout;
+            // Add the timeout to the wheel.
+            HashedWheelTimeout timeout = new HashedWheelTimeout(this, task, deadline, remainingRounds);
+
+            final long ticks = Math.max(calculated, t); // Ensure we don't schedule for past.
+            int stopIndex = (int) (ticks & mask);
+
+            HashedWheelBucket bucket = wheel[stopIndex];
+            if (bucket.add(timeout)) {
+                // we was able to add to the bucket as it was not in progress atm. If not we need to try again
+                return timeout;
+            }
+        }
     }
 
     private final class Worker implements Runnable {
@@ -420,7 +435,7 @@ public class HashedWheelTimer implements Timer {
             }
         }
 
-        public Set<Timeout> notProcessedTimeouts() {
+        public Set<Timeout> unprocessedTimeouts() {
             return Collections.unmodifiableSet(unprocessedTimeouts);
         }
     }
@@ -444,21 +459,16 @@ public class HashedWheelTimer implements Timer {
         private final HashedWheelTimer timer;
         private final TimerTask task;
         private final long deadline;
-        private final int stopIndex;
         private long remainingRounds;
+
         @SuppressWarnings({"unused", "FieldMayBeFinal", "RedundantFieldInitialization" })
         private volatile int state = ST_INIT;
 
-        HashedWheelTimeout(HashedWheelTimer timer, TimerTask task, long deadline) {
+        HashedWheelTimeout(HashedWheelTimer timer, TimerTask task, long deadline, long remainingRounds) {
             this.timer = timer;
             this.task = task;
             this.deadline = deadline;
-
-            long t = TICK_UPDATER.get(timer);
-            long calculated = deadline / timer.tickDuration;
-            final long ticks = Math.max(calculated, t); // Ensure we don't schedule for past.
-            stopIndex = (int) (ticks & timer.mask);
-            remainingRounds = (calculated - t) / timer.wheel.length;
+            this.remainingRounds = remainingRounds;
         }
 
         @Override
@@ -559,15 +569,16 @@ public class HashedWheelTimer implements Timer {
         private static final AtomicReferenceFieldUpdater<HashedWheelBucket, HashedWheelTimeoutNode> TAIL_UPDATER;
 
         static {
-            AtomicReferenceFieldUpdater<HashedWheelBucket, HashedWheelTimeoutNode> updater =
+            AtomicReferenceFieldUpdater<HashedWheelBucket, HashedWheelTimeoutNode> tailUpdater =
                     PlatformDependent.newAtomicReferenceFieldUpdater(HashedWheelBucket.class, "tail");
-            if (updater == null) {
-                updater = AtomicReferenceFieldUpdater.newUpdater(
+            if (tailUpdater == null) {
+                tailUpdater = AtomicReferenceFieldUpdater.newUpdater(
                         HashedWheelBucket.class, HashedWheelTimeoutNode.class, "tail");
             }
-            TAIL_UPDATER = updater;
+            TAIL_UPDATER = tailUpdater;
         }
 
+        private final ReadWriteLock lock = new ReentrantReadWriteLock();
         // just used for asserts
         private final Thread workerThread;
         @SuppressWarnings({ "unused", "FieldMayBeFinal" })
@@ -583,9 +594,19 @@ public class HashedWheelTimer implements Timer {
         /**
          * Add {@link HashedWheelTimeoutNode} to this bucket.
          */
-        public void add(HashedWheelTimeoutNode timeout) {
+        public boolean add(HashedWheelTimeoutNode timeout) {
             timeout.setNext(null);
-            getAndSet(timeout).setNext(timeout);
+            Lock l = lock.readLock();
+            // try to lock if not possible it is hold because of
+            if (l.tryLock()) {
+                try {
+                    getAndSet(timeout).setNext(timeout);
+                    return true;
+                } finally {
+                    l.unlock();
+                }
+            }
+            return false;
         }
 
         /**
@@ -593,33 +614,39 @@ public class HashedWheelTimer implements Timer {
          */
         public void expireTimeouts(long deadline) {
             assert Thread.currentThread() == workerThread;
-            HashedWheelTimeoutNode last = get();
+            Lock l = lock.writeLock();
+            try {
+                l.lock();
+                HashedWheelTimeoutNode last = get();
 
-            for (;;) {
-                HashedWheelTimeoutNode node = pollNode();
+                for (;;) {
+                    HashedWheelTimeoutNode node = pollNode();
 
-                if (node == null) {
-                    // all nodes are processed
-                    break;
-                }
-
-                if (node.remainingRounds() <= 0) {
-                    if (node.deadline() <= deadline) {
-                        node.expire();
-                    } else {
-                        // The timeout was placed into a wrong slot. This should never happen.
-                        throw new Error(String.format(
-                                "timeout.deadline (%d) > deadline (%d)", node.deadline(), deadline));
+                    if (node == null) {
+                        // all nodes are processed
+                        break;
                     }
-                } else if (!node.isCancelled()) {
-                    // decrement and add again
-                    node.decrementRemainingRounds();
-                    add(node);
+
+                    if (node.remainingRounds() <= 0) {
+                        if (node.deadline() <= deadline) {
+                            node.expire();
+                        } else {
+                            // The timeout was placed into a wrong slot. This should never happen.
+                            throw new Error(String.format(
+                                    "timeout.deadline (%d) > deadline (%d)", node.deadline(), deadline));
+                        }
+                    } else if (!node.isCancelled()) {
+                        // decrement and add again
+                        node.decrementRemainingRounds();
+                        add(node);
+                    }
+                    if (node == last) {
+                        // We reached the node that was the last node when we started so stop here.
+                        break;
+                    }
                 }
-                if (node == last) {
-                    // We reached the node that was the last node when we started so stop here.
-                    break;
-                }
+            } finally {
+                l.unlock();
             }
         }
 
