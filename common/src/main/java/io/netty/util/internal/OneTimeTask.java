@@ -26,7 +26,7 @@ import io.netty.util.concurrent.EventExecutor;
 public abstract class OneTimeTask extends MpscLinkedQueue.Node<Runnable> implements Runnable {
 
     @Override
-    Runnable value() {
+    public Runnable value() {
         return this;
     }
 }

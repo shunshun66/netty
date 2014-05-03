@@ -15,6 +15,7 @@
  */
 package io.netty.util;
 
+import io.netty.util.internal.MpscLinkedQueue;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.StringUtil;
 import io.netty.util.internal.logging.InternalLogger;
@@ -22,15 +23,13 @@ import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
-import java.util.concurrent.atomic.AtomicLongFieldUpdater;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
 /**
  * A {@link Timer} optimized for approximated I/O timeout scheduling.
@@ -83,7 +82,6 @@ public class HashedWheelTimer implements Timer {
                     HashedWheelTimer.class, 1, Runtime.getRuntime().availableProcessors() * 4);
 
     private static final AtomicIntegerFieldUpdater<HashedWheelTimer> WORKER_STATE_UPDATER;
-    private static final AtomicLongFieldUpdater<HashedWheelTimer> TICK_UPDATER;
     static {
         AtomicIntegerFieldUpdater<HashedWheelTimer> workerStateUpdater =
                 PlatformDependent.newAtomicIntegerFieldUpdater(HashedWheelTimer.class, "workerState");
@@ -91,13 +89,6 @@ public class HashedWheelTimer implements Timer {
             workerStateUpdater = AtomicIntegerFieldUpdater.newUpdater(HashedWheelTimer.class, "workerState");
         }
         WORKER_STATE_UPDATER = workerStateUpdater;
-
-        AtomicLongFieldUpdater<HashedWheelTimer> tickUpdater =
-                PlatformDependent.newAtomicLongFieldUpdater(HashedWheelTimer.class, "tick");
-        if (tickUpdater == null) {
-            tickUpdater = AtomicLongFieldUpdater.newUpdater(HashedWheelTimer.class, "tick");
-        }
-        TICK_UPDATER = tickUpdater;
     }
 
     private final ResourceLeak leak;
@@ -114,10 +105,8 @@ public class HashedWheelTimer implements Timer {
     private final HashedWheelBucket[] wheel;
     private final int mask;
     private final CountDownLatch startTimeInitialized = new CountDownLatch(1);
+    private final Queue<HashedWheelTimeout> timeouts = PlatformDependent.newMpscQueue();
     private volatile long startTime;
-
-    @SuppressWarnings("unused")
-    private volatile long tick;
 
     /**
      * Creates a new timer with the default thread factory
@@ -213,10 +202,9 @@ public class HashedWheelTimer implements Timer {
         if (ticksPerWheel <= 0) {
             throw new IllegalArgumentException("ticksPerWheel must be greater than 0: " + ticksPerWheel);
         }
-        workerThread = threadFactory.newThread(worker);
 
         // Normalize ticksPerWheel to power of two and initialize the wheel.
-        wheel = createWheel(ticksPerWheel, this);
+        wheel = createWheel(ticksPerWheel);
         mask = wheel.length - 1;
 
         // Convert tickDuration to nanos.
@@ -228,12 +216,13 @@ public class HashedWheelTimer implements Timer {
                     "tickDuration: %d (expected: 0 < tickDuration in nanos < %d",
                     tickDuration, Long.MAX_VALUE / wheel.length));
         }
+        workerThread = threadFactory.newThread(worker);
 
         leak = leakDetector.open(this);
     }
 
     @SuppressWarnings("unchecked")
-    private static HashedWheelBucket[] createWheel(int ticksPerWheel, HashedWheelTimer timer) {
+    private static HashedWheelBucket[] createWheel(int ticksPerWheel) {
         if (ticksPerWheel <= 0) {
             throw new IllegalArgumentException(
                     "ticksPerWheel must be greater than 0: " + ticksPerWheel);
@@ -246,7 +235,7 @@ public class HashedWheelTimer implements Timer {
         ticksPerWheel = normalizeTicksPerWheel(ticksPerWheel);
         HashedWheelBucket[] wheel = new HashedWheelBucket[ticksPerWheel];
         for (int i = 0; i < wheel.length; i ++) {
-            wheel[i] = new HashedWheelBucket(timer);
+            wheel[i] = new HashedWheelBucket();
         }
         return wheel;
     }
@@ -341,29 +330,18 @@ public class HashedWheelTimer implements Timer {
         }
         start();
 
+        // Add the timeout to the timeout queue which will be processed on the next tick.
+        // During processing all the queued HashedWheelTimeouts will be added to the correct HashedWheelBucket.
         long deadline = System.nanoTime() + unit.toNanos(delay) - startTime;
-        long calculated = deadline / tickDuration;
-
-        for (;;) {
-            long t = TICK_UPDATER.get(this);
-            long remainingRounds = (calculated - t) / wheel.length;
-
-            HashedWheelTimeout timeout = new HashedWheelTimeout(this, task, deadline, remainingRounds);
-
-            final long ticks = Math.max(calculated, t); // Ensure we don't schedule for past.
-            int stopIndex = (int) (ticks & mask);
-
-            HashedWheelBucket bucket = wheel[stopIndex];
-            if (bucket.add(timeout, t)) {
-                // we was able to add to the bucket
-                return timeout;
-            }
-            // if hit here we need to retry adding it to a bucket
-        }
+        HashedWheelTimeout timeout = new HashedWheelTimeout(this, task, deadline);
+        timeouts.add(timeout);
+        return timeout;
     }
 
     private final class Worker implements Runnable {
         private final Set<Timeout> unprocessedTimeouts = new HashSet<Timeout>();
+
+        private long tick;
 
         @Override
         public void run() {
@@ -380,18 +358,45 @@ public class HashedWheelTimer implements Timer {
             do {
                 final long deadline = waitForNextTick();
                 if (deadline > 0) {
+                    transferTimeoutsToBuckets();
                     HashedWheelBucket bucket =
-                            wheel[(int) (TICK_UPDATER.getAndIncrement(HashedWheelTimer.this) & mask)];
+                            wheel[(int) (tick & mask)];
                     bucket.expireTimeouts(deadline);
+                    tick++;
                 }
             } while (WORKER_STATE_UPDATER.get(HashedWheelTimer.this) == WORKER_STATE_STARTED);
 
             // Fill the unprocessedTimeouts so we can return them from stop() method.
             for (HashedWheelBucket bucket: wheel) {
-                bucket.clear(unprocessedTimeouts);
+                bucket.clearTimeouts(unprocessedTimeouts);
+            }
+            for (;;) {
+                HashedWheelTimeout timeout = timeouts.poll();
+                if (timeout == null) {
+                    break;
+                }
+                unprocessedTimeouts.add(timeout);
             }
         }
 
+        private void transferTimeoutsToBuckets() {
+            for (;;) {
+                HashedWheelTimeout timeout = timeouts.poll();
+                if (timeout == null) {
+                    // all processed
+                    break;
+                }
+                long calculated = timeout.deadline / tickDuration;
+                long remainingRounds = (calculated - tick) / wheel.length;
+                timeout.remainingRounds = remainingRounds;
+
+                final long ticks = Math.max(calculated, tick); // Ensure we don't schedule for past.
+                int stopIndex = (int) (ticks & mask);
+
+                HashedWheelBucket bucket = wheel[stopIndex];
+                bucket.addTimeout(timeout);
+            }
+        }
         /**
          * calculate goal nanoTime from startTime and current tick number,
          * then wait until that goal has been reached.
@@ -399,7 +404,7 @@ public class HashedWheelTimer implements Timer {
          * current time otherwise (with Long.MIN_VALUE changed by +1)
          */
         private long waitForNextTick() {
-            long deadline = tickDuration * (TICK_UPDATER.get(HashedWheelTimer.this) + 1);
+            long deadline = tickDuration * (tick + 1);
 
             for (;;) {
                 final long currentTime = System.nanoTime() - startTime;
@@ -437,7 +442,8 @@ public class HashedWheelTimer implements Timer {
         }
     }
 
-    private static final class HashedWheelTimeout extends HashedWheelTimeoutNode {
+    private static final class HashedWheelTimeout extends MpscLinkedQueue.Node<Timeout>
+            implements Timeout {
 
         private static final int ST_INIT = 0;
         private static final int ST_CANCELLED = 1;
@@ -456,16 +462,23 @@ public class HashedWheelTimer implements Timer {
         private final HashedWheelTimer timer;
         private final TimerTask task;
         private final long deadline;
-        private long remainingRounds;
 
         @SuppressWarnings({"unused", "FieldMayBeFinal", "RedundantFieldInitialization" })
         private volatile int state = ST_INIT;
 
-        HashedWheelTimeout(HashedWheelTimer timer, TimerTask task, long deadline, long remainingRounds) {
+        // remainingRounds will be calculated and set by Worker.transferTimeoutsToBuckets() before the
+        // HashedWheelTimeout will be added to the correct HashedWheelBucket.
+        long remainingRounds;
+
+        // This will be used to chain timeouts in HashedWheelTimerBucket via a double-linked-list.
+        // As only the workerThread will act on it there is no need for synchronization / volatile.
+        HashedWheelTimeout next;
+        HashedWheelTimeout prev;
+
+        HashedWheelTimeout(HashedWheelTimer timer, TimerTask task, long deadline) {
             this.timer = timer;
             this.task = task;
             this.deadline = deadline;
-            this.remainingRounds = remainingRounds;
         }
 
         @Override
@@ -498,6 +511,10 @@ public class HashedWheelTimer implements Timer {
         }
 
         @Override
+        public HashedWheelTimeout value() {
+            return this;
+        }
+
         public void expire() {
             if (!STATE_UPDATER.compareAndSet(this, ST_INIT, ST_EXPIRED)) {
                 return;
@@ -510,21 +527,6 @@ public class HashedWheelTimer implements Timer {
                     logger.warn("An exception was thrown by " + TimerTask.class.getSimpleName() + '.', t);
                 }
             }
-        }
-
-        @Override
-        long deadline() {
-            return deadline;
-        }
-
-        @Override
-        long remainingRounds() {
-            return remainingRounds;
-        }
-
-        @Override
-        void decrementRemainingRounds() {
-            remainingRounds --;
         }
 
         @Override
@@ -559,206 +561,101 @@ public class HashedWheelTimer implements Timer {
     }
 
     /**
-     * Hashed-Wheel-Bucket for MPSC work-pattern.
+     * Bucket that stores HashedWheelTimeouts. These are stored in a linked-list like datastructure to allow easy
+     * removal of HashedWheelTimeouts in the middle. Also the HashedWheelTimeout act as nodes themself and so no
+     * extra object creation is needed.
      */
-    @SuppressWarnings("serial")
-    static final class HashedWheelBucket extends AtomicReference<HashedWheelTimeoutNode> {
-        private static final AtomicReferenceFieldUpdater<HashedWheelBucket, HashedWheelTimeoutNode> TAIL_UPDATER;
+    static final class HashedWheelBucket {
 
-        static {
-            AtomicReferenceFieldUpdater<HashedWheelBucket, HashedWheelTimeoutNode> tailUpdater =
-                    PlatformDependent.newAtomicReferenceFieldUpdater(HashedWheelBucket.class, "tail");
-            if (tailUpdater == null) {
-                tailUpdater = AtomicReferenceFieldUpdater.newUpdater(
-                        HashedWheelBucket.class, HashedWheelTimeoutNode.class, "tail");
-            }
-            TAIL_UPDATER = tailUpdater;
-        }
-
-        private final HashedWheelTimer timer;
-
-        @SuppressWarnings({ "unused", "FieldMayBeFinal" })
-        private volatile HashedWheelTimeoutNode tail;
-
-        HashedWheelBucket(HashedWheelTimer timer) {
-            this.timer = timer;
-            HashedWheelTimeoutNode node = new HashedWheelTimeoutNode();
-            tail = node;
-            set(node);
-        }
+        // Used for the linked-list datastructure
+        private HashedWheelTimeout head;
+        private HashedWheelTimeout tail;
 
         /**
-         * Add {@link HashedWheelTimeoutNode} to this bucket.
+         * Add {@link HashedWheelTimeout} to this bucket.
          */
-        public boolean add(HashedWheelTimeoutNode timeout, long expectedTick) {
-            getAndSet(timeout).setNext(timeout);
-            // If the expectedTick is < we may need to reschedule the timeout.
-            // This is mainly needed as it may be possible that we added the timeout after the tick was processed
-            if (expectedTick < TICK_UPDATER.get(timer)) {
-                // try to cancel the timeout. If it was succesful it means that the timeout was not run yet and so
-                // we can add it to another bucket.
-                return !timeout.cancel();
+        public void addTimeout(HashedWheelTimeout timeout) {
+            if (head == null) {
+                head = tail = timeout;
+            } else {
+                tail.next = timeout;
+                timeout.prev = tail;
+                tail = timeout;
             }
-            return true;
         }
 
         /**
-         * Expire all {@link HashedWheelTimeoutNode}s for the given {@code deadline}.
+         * Expire all {@link HashedWheelTimeout}s for the given {@code deadline}.
          */
         public void expireTimeouts(long deadline) {
-            assert Thread.currentThread() == timer.workerThread;
-            // Store chain of nodes which needs to be added back to the queue.
-            HashedWheelTimeoutNode remainingFirst = null;
-            HashedWheelTimeoutNode remainingLast = null;
-            try {
-                for (;;) {
-                    HashedWheelTimeoutNode node = pollNode();
-                    if (node == null) {
-                        // all nodes are processed
-                        break;
-                    }
+            HashedWheelTimeout timeout = head;
 
-                    if (node.remainingRounds() <= 0) {
-                        if (node.deadline() <= deadline) {
-                            node.expire();
-                        } else {
-                            // The timeout was placed into a wrong slot. This should never happen.
-                            throw new Error(String.format(
-                                    "timeout.deadline (%d) > deadline (%d)", node.deadline(), deadline));
-                        }
-                    } else if (!node.isCancelled()) {
-                        // decrement and prepare to add back
-                        node.decrementRemainingRounds();
-                        node.setNext(null);
-
-                        if (remainingFirst == null) {
-                            remainingFirst = node;
-                            remainingLast = node;
-                        } else {
-                            remainingLast.setNext(node);
-                            remainingLast = node;
-                        }
+            // process all timeouts
+            while (timeout != null) {
+                boolean remove = false;
+                if (timeout.remainingRounds <= 0) {
+                    if (timeout.deadline <= deadline) {
+                        timeout.expire();
+                    } else {
+                        // The timeout was placed into a wrong slot. This should never happen.
+                        throw new IllegalStateException(String.format(
+                                "timeout.deadline (%d) > deadline (%d)", timeout.deadline, deadline));
                     }
+                    remove = true;
+                } else if (timeout.isCancelled()) {
+                    remove = true;
+                } else {
+                    timeout.remainingRounds --;
                 }
-            } finally {
-                // We had some nodes that were not ready to expire. Add them back to the queue so these are picked
-                // up on the next expireTimeouts(...) call.
-                if (remainingFirst != null) {
-                    HashedWheelTimeoutNode node = remainingFirst;
-                    do {
-                        HashedWheelTimeoutNode next = node.next;
-                        node.setNext(null);
-                        getAndSet(node).setNext(node);
-                        node = next;
-                    } while (node != null);
+                if (remove) {
+                    // remove timeout that was either processed or cancelled by updating the linked-list
+                    if (timeout.prev != null) {
+                        timeout.prev.next = timeout.next;
+                    }
+                    if (timeout.next != null) {
+                        timeout.next.prev = timeout.prev;
+                    }
+                    // null out prev and next to allow for GC.
+                    timeout.prev = null;
+                    timeout.next = null;
                 }
+                timeout = timeout.next;
             }
         }
 
         /**
          * Clear this bucket and return all not expired / cancelled {@link Timeout}s.
          */
-        public void clear(Set<Timeout> set) {
-            assert Thread.currentThread() == timer.workerThread;
+        public void clearTimeouts(Set<Timeout> set) {
             for (;;) {
-                HashedWheelTimeoutNode node = pollNode();
-                if (node == null) {
+                HashedWheelTimeout timeout = pollTimeout();
+                if (timeout == null) {
                     return;
                 }
-                if (node.isExpired() || node.isCancelled()) {
+                if (timeout.isExpired() || timeout.isCancelled()) {
                     continue;
                 }
-                set.add(node);
+                set.add(timeout);
             }
         }
 
-        private HashedWheelTimeoutNode pollNode() {
-            HashedWheelTimeoutNode next;
-            for (;;) {
-                final HashedWheelTimeoutNode tail = TAIL_UPDATER.get(this);
-                next = tail.next();
-                if (next != null || get() == tail) {
-                    break;
-                }
-            }
-            if (next == null) {
+        private HashedWheelTimeout pollTimeout() {
+            HashedWheelTimeout head = this.head;
+            if (head == null) {
                 return null;
             }
-            final HashedWheelTimeoutNode ret = next;
-            // Using lazySet is good enough here as pollNode will always be called from the workerThread, which
-            // basically means we have a single-consumer here.
-            TAIL_UPDATER.lazySet(this, next);
-            return ret;
-        }
-    }
-
-    static class HashedWheelTimeoutNode implements Timeout {
-        private static final AtomicReferenceFieldUpdater<HashedWheelTimeoutNode, HashedWheelTimeoutNode> NEXT_UPDATER;
-
-        static {
-            AtomicReferenceFieldUpdater<HashedWheelTimeoutNode, HashedWheelTimeoutNode> updater =
-                    PlatformDependent.newAtomicReferenceFieldUpdater(HashedWheelTimeoutNode.class, "next");
-            if (updater == null) {
-                updater = AtomicReferenceFieldUpdater.newUpdater(
-                        HashedWheelTimeoutNode.class, HashedWheelTimeoutNode.class, "next");
+            HashedWheelTimeout next = head.next;
+            if (next == null) {
+                tail = this.head =  null;
+            } else {
+                this.head = next;
+                next.prev = null;
             }
-            NEXT_UPDATER = updater;
-        }
 
-        @SuppressWarnings("unused")
-        private volatile HashedWheelTimeoutNode next;
-
-        final HashedWheelTimeoutNode next() {
-            return NEXT_UPDATER.get(this);
-        }
-
-        final void setNext(HashedWheelTimeoutNode next) {
-            // Using lazySet is good enough here as pollNode will always be called from the workerThread, which
-            // basically means we have a single-consumer here.
-            NEXT_UPDATER.lazySet(this, next);
-        }
-
-        long deadline() {
-            return 0;
-        }
-
-        long remainingRounds() {
-            return 1;
-        }
-
-        void decrementRemainingRounds() {
-            // noop
-        }
-
-        @Override
-        public Timer timer() {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public TimerTask task() {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean isExpired() {
-            // never expires
-            return false;
-        }
-
-        @Override
-        public boolean isCancelled() {
-            // never is cancelled
-            return false;
-        }
-
-        @Override
-        public boolean cancel() {
-            return false;
-        }
-
-        public void expire() {
-            // noop
+            // null out prev and next to allow for GC.
+            head.next = null;
+            head.prev = null;
+            return head;
         }
     }
 }

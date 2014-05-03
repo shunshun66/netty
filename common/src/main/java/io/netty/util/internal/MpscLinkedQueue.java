@@ -229,7 +229,7 @@ public final class MpscLinkedQueue<T> extends AtomicReference<MpscLinkedQueue.No
         }
 
         @Override
-        T value() {
+        public T value() {
             return value;
         }
     }
@@ -265,6 +265,6 @@ public final class MpscLinkedQueue<T> extends AtomicReference<MpscLinkedQueue.No
             PlatformDependent.putOrderedObject(this, nextOffset, newNext);
         }
 
-        abstract T value();
+        public abstract T value();
     }
 }
