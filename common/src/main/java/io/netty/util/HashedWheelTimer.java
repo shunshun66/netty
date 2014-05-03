@@ -380,7 +380,9 @@ public class HashedWheelTimer implements Timer {
         }
 
         private void transferTimeoutsToBuckets() {
-            for (;;) {
+            // transfer only max. 10000 timeouts per tick to prevent a thread to stale the workerThread when it just
+            // adds new timeouts in a loop.
+            for (int i = 0; i < 10000; i++) {
                 HashedWheelTimeout timeout = timeouts.poll();
                 if (timeout == null) {
                     // all processed
