@@ -565,7 +565,7 @@ public class HashedWheelTimer implements Timer {
      * removal of HashedWheelTimeouts in the middle. Also the HashedWheelTimeout act as nodes themself and so no
      * extra object creation is needed.
      */
-    static final class HashedWheelBucket {
+    private static final class HashedWheelBucket {
 
         // Used for the linked-list datastructure
         private HashedWheelTimeout head;
