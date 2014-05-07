@@ -380,9 +380,9 @@ public class HashedWheelTimer implements Timer {
         }
 
         private void transferTimeoutsToBuckets() {
-            // transfer only max. 10000 timeouts per tick to prevent a thread to stale the workerThread when it just
+            // transfer only max. 100000 timeouts per tick to prevent a thread to stale the workerThread when it just
             // adds new timeouts in a loop.
-            for (int i = 0; i < 10000; i++) {
+            for (int i = 0; i < 100000; i++) {
                 HashedWheelTimeout timeout = timeouts.poll();
                 if (timeout == null) {
                     // all processed
@@ -609,6 +609,8 @@ public class HashedWheelTimer implements Timer {
                 } else {
                     timeout.remainingRounds --;
                 }
+                // store reference to next as we may null out timeout.next in the remove block.
+                HashedWheelTimeout next = timeout.next;
                 if (remove) {
                     // remove timeout that was either processed or cancelled by updating the linked-list
                     if (timeout.prev != null) {
@@ -617,11 +619,23 @@ public class HashedWheelTimer implements Timer {
                     if (timeout.next != null) {
                         timeout.next.prev = timeout.prev;
                     }
+
+                    if (timeout == head) {
+                        // if timeout is head we need to replace the head with the next entry
+                        head = next;
+                        if (timeout == tail) {
+                            // if timeout is also the tail we need to adjust the entry too
+                            tail = timeout.next;
+                        }
+                    } else if (timeout == tail) {
+                        // if the timeout is the tail modify the tail to be the prev node.
+                        tail = timeout.prev;
+                    }
                     // null out prev and next to allow for GC.
                     timeout.prev = null;
                     timeout.next = null;
                 }
-                timeout = timeout.next;
+                timeout = next;
             }
         }
 
